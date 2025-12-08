@@ -108,7 +108,8 @@ func HealthChecker(p *EndpointPool, cfg *config.Config) {
 func checkBackendHealth(ep *Endpoint, cfg *config.Config) {
 	// Mock Health Check: Send a simple GET request
 	client := http.Client{Timeout: 3 * time.Second}
-	healthURL := fmt.Sprintf("https://%s/health", ep.Address)
+	// Use the endpoint's scheme (HTTP or HTTPS) as determined during initialization
+	healthURL := fmt.Sprintf("%s://%s/health", ep.URL.Scheme, ep.Address)
 	resp, err := client.Get(healthURL)
 
 	ep.Mutex.Lock()
@@ -247,7 +248,11 @@ func ProxyHandler(p *EndpointPool, cfg *config.Config) http.HandlerFunc {
 			http.Error(w, "Gateway Timeout or Target Error", http.StatusGatewayTimeout)
 		}
 
-		log.Printf("[ProxyServer] Routing request to %s://%s%s (Score: %.3f)", targetEndpoint.URL.Scheme, targetEndpoint.Address, r.URL.Path, targetEndpoint.Score)
+		// Read score with proper mutex protection to avoid data race
+		targetEndpoint.Mutex.Lock()
+		score := targetEndpoint.Score
+		targetEndpoint.Mutex.Unlock()
+		log.Printf("[ProxyServer] Routing request to %s://%s%s (Score: %.3f)", targetEndpoint.URL.Scheme, targetEndpoint.Address, r.URL.Path, score)
 		proxy.ServeHTTP(w, r)
 	}
 }
@@ -278,8 +283,6 @@ func main() {
 	for _, addr := range cfg.BackendAddresses {
 		pool.Endpoints = append(pool.Endpoints, NewEndpoint(addr))
 	}
-
-	log.Println("All mock backend servers started.")
 
 	// 1. Start Management Layer routines
 	go HealthChecker(pool, cfg)
