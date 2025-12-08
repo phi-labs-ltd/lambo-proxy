@@ -4,201 +4,17 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
-	"math/rand"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"os"
-	"sync"
 	"time"
 
-	"github.com/archway-network/lambo/config"
+	"github.com/archway-network/lambo/pkg/config"
+	"github.com/archway-network/lambo/pkg/manager"
 )
 
-// --- Data Layer Structures (2.1) ---
-
-// Endpoint holds the dynamic metrics for a single backend service.
-type Endpoint struct {
-	Address          string     // e.g., "localhost:8081"
-	URL              *url.URL   // Parsed URL for the reverse proxy
-	IsHealthy        bool       // Status from HealthChecker
-	Score            float64    // Reliability Score (0.0 to 1.0)
-	LatencyMs        float64    // Latest measured latency
-	Mutex            sync.Mutex // Protects metrics updates
-	ConsecutiveFails int        // Counter for HealthChecker
-}
-
-// EndpointPool is the thread-safe container for all backend services.
-type EndpointPool struct {
-	Endpoints []*Endpoint
-	Mutex     sync.RWMutex // Protects the slice itself
-}
-
-// NewEndpoint creates a new endpoint, parsing the address into a URL object.
-func NewEndpoint(addr string) *Endpoint {
-	// Determine scheme based on port: 443 = HTTPS, others = HTTP
-	scheme := "http"
-	if len(addr) > 4 && addr[len(addr)-4:] == ":443" {
-		scheme = "https"
-	}
-	u, _ := url.Parse(fmt.Sprintf("%s://%s", scheme, addr))
-	return &Endpoint{
-		Address:   addr,
-		URL:       u,
-		IsHealthy: true, // Assume healthy on startup
-		Score:     0.5,  // Start at baseline score
-		LatencyMs: 50.0, // Baseline latency
-	}
-}
-
-// --- Management Layer (2.2) ---
-
-// UpdateScore applies the Exponentially Weighted Moving Average (EWMA) to the endpoint's score.
-// Latency penalty is handled separately in the Load Balancer selection.
-func (e *Endpoint) UpdateScore(success bool, duration time.Duration, ewmaAlpha float64) {
-	e.Mutex.Lock()
-	defer e.Mutex.Unlock()
-
-	// 1. Update Latency
-	e.LatencyMs = float64(duration.Milliseconds())
-
-	// 2. Determine Instantaneous Performance (Pi)
-	var pi float64
-	if success {
-		pi = 1.0
-	} else {
-		pi = 0.0
-	}
-
-	// 3. Apply EWMA Formula: S_new = alpha * P_i + (1 - alpha) * S_old
-	e.Score = ewmaAlpha*pi + (1-ewmaAlpha)*e.Score
-
-	// Ensure score remains within [0.0, 1.0]
-	if e.Score < 0.01 {
-		e.Score = 0.01 // Prevent zero weight, ensuring test traffic continues
-	} else if e.Score > 1.0 {
-		e.Score = 1.0
-	}
-
-	log.Printf("[ScoreTracker] %s | Latency: %.2fms | Success: %t | New Score: %.3f",
-		e.Address, e.LatencyMs, success, e.Score)
-}
-
-// HealthChecker continuously probes backends and updates their IsHealthy status.
-func HealthChecker(p *EndpointPool, cfg *config.Config) {
-	for {
-		p.Mutex.RLock()
-		endpoints := p.Endpoints
-		p.Mutex.RUnlock()
-
-		var wg sync.WaitGroup
-		for _, ep := range endpoints {
-			wg.Add(1)
-			go func(ep *Endpoint) {
-				defer wg.Done()
-				checkBackendHealth(ep, cfg)
-			}(ep)
-		}
-		wg.Wait()
-		time.Sleep(cfg.HealthCheckInterval)
-	}
-}
-
-func checkBackendHealth(ep *Endpoint, cfg *config.Config) {
-	// Mock Health Check: Send a simple GET request
-	client := http.Client{Timeout: 3 * time.Second}
-	// Use the endpoint's scheme (HTTP or HTTPS) as determined during initialization
-	healthURL := fmt.Sprintf("%s://%s/health", ep.URL.Scheme, ep.Address)
-	resp, err := client.Get(healthURL)
-
-	ep.Mutex.Lock()
-	defer ep.Mutex.Unlock()
-
-	if err != nil || resp.StatusCode != http.StatusOK {
-		ep.ConsecutiveFails++
-		log.Printf("[HealthCheck] %s FAILED (%d/%d): %v", ep.Address, ep.ConsecutiveFails, cfg.HealthCheckFailures, err)
-
-		if ep.ConsecutiveFails >= cfg.HealthCheckFailures && ep.IsHealthy {
-			ep.IsHealthy = false
-			log.Printf("[HealthCheck] %s marked UNHEALTHY (Policy: Failure Count)", ep.Address)
-		}
-	} else {
-		if !ep.IsHealthy {
-			// Recovery Policy: Reset score to baseline (0.5) when healthy again
-			ep.Score = 0.5
-			log.Printf("[HealthCheck] %s recovered. Score reset to 0.5.", ep.Address)
-		}
-		ep.IsHealthy = true
-		ep.ConsecutiveFails = 0
-	}
-	if resp != nil {
-		resp.Body.Close()
-	}
-}
-
-// --- Request Layer (2.3) ---
-
-// Select implements the Weighted Random Choice (WRC) algorithm.
-func (p *EndpointPool) Select() *Endpoint {
-	p.Mutex.RLock()
-	defer p.Mutex.RUnlock()
-
-	// 1. Filter: Get all healthy endpoints
-	var candidates []*Endpoint
-	for _, ep := range p.Endpoints {
-		ep.Mutex.Lock()
-		if ep.IsHealthy {
-			candidates = append(candidates, ep)
-		}
-		ep.Mutex.Unlock()
-	}
-
-	if len(candidates) == 0 {
-		return nil // No healthy endpoint found
-	}
-
-	// 2. Calculate Effective Weight (Weff)
-	var effectiveWeights []float64
-	var totalWeight float64
-
-	for _, ep := range candidates {
-		ep.Mutex.Lock() // Lock to read metrics
-		score := ep.Score
-		latency := ep.LatencyMs
-		ep.Mutex.Unlock() // Unlock after reading
-
-		// Latency is at least 1ms to prevent log(1) which is zero
-		if latency < 1.0 {
-			latency = 1.0
-		}
-
-		// Calculate Latency Penalty Multiplier: 1 / log2(LatencyMs + 2)
-		// log2(1+2) = 1.58 -> multiplier ~0.63
-		// log2(50+2) = 5.70 -> multiplier ~0.17
-		latencyMultiplier := 1.0 / math.Log2(latency+2)
-
-		// W_eff = S * Multiplier
-		weight := score * latencyMultiplier
-		effectiveWeights = append(effectiveWeights, weight)
-		totalWeight += weight
-	}
-
-	// 3. Weighted Random Selection
-	r := rand.Float64() * totalWeight
-	var runningWeight float64
-	for i, weight := range effectiveWeights {
-		runningWeight += weight
-		if r <= runningWeight {
-			return candidates[i]
-		}
-	}
-	// Should not be reached, but as a safe fallback
-	return candidates[len(candidates)-1]
-}
-
 // ProxyHandler handles incoming client requests.
-func ProxyHandler(p *EndpointPool, cfg *config.Config) http.HandlerFunc {
+func ProxyHandler(p *manager.EndpointPool, cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -277,15 +93,15 @@ func main() {
 	}
 
 	// Define the pool of backend endpoints
-	pool := &EndpointPool{Endpoints: make([]*Endpoint, 0, len(cfg.BackendAddresses))}
+	pool := &manager.EndpointPool{Endpoints: make([]*manager.Endpoint, 0, len(cfg.BackendAddresses))}
 
 	// Populate the EndpointPool
 	for _, addr := range cfg.BackendAddresses {
-		pool.Endpoints = append(pool.Endpoints, NewEndpoint(addr))
+		pool.Endpoints = append(pool.Endpoints, manager.NewEndpoint(addr))
 	}
 
 	// 1. Start Management Layer routines
-	go HealthChecker(pool, cfg)
+	go manager.HealthChecker(pool, cfg)
 	log.Println("HealthChecker started.")
 
 	// 2. Start Request Layer (Proxy Server)
