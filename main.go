@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"math"
@@ -8,16 +9,11 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"sync"
 	"time"
-)
 
-// --- Configuration Constants ---
-const (
-	ProxyPort           = 8080
-	HealthCheckInterval = 5 * time.Second
-	HealthCheckFailures = 3   // M: Consecutive failures before marked unhealthy
-	EWMAAlpha           = 0.1 // Alpha: Decay factor for EWMA (0.1 = slow memory)
+	"github.com/archway-network/lambo/config"
 )
 
 // --- Data Layer Structures (2.1) ---
@@ -60,7 +56,7 @@ func NewEndpoint(addr string) *Endpoint {
 
 // UpdateScore applies the Exponentially Weighted Moving Average (EWMA) to the endpoint's score.
 // Latency penalty is handled separately in the Load Balancer selection.
-func (e *Endpoint) UpdateScore(success bool, duration time.Duration) {
+func (e *Endpoint) UpdateScore(success bool, duration time.Duration, ewmaAlpha float64) {
 	e.Mutex.Lock()
 	defer e.Mutex.Unlock()
 
@@ -76,7 +72,7 @@ func (e *Endpoint) UpdateScore(success bool, duration time.Duration) {
 	}
 
 	// 3. Apply EWMA Formula: S_new = alpha * P_i + (1 - alpha) * S_old
-	e.Score = EWMAAlpha*pi + (1-EWMAAlpha)*e.Score
+	e.Score = ewmaAlpha*pi + (1-ewmaAlpha)*e.Score
 
 	// Ensure score remains within [0.0, 1.0]
 	if e.Score < 0.01 {
@@ -85,12 +81,12 @@ func (e *Endpoint) UpdateScore(success bool, duration time.Duration) {
 		e.Score = 1.0
 	}
 
-	log.Printf("[ScoreTracker] %s | Latency: %dms | Success: %t | New Score: %.3f",
+	log.Printf("[ScoreTracker] %s | Latency: %.2fms | Success: %t | New Score: %.3f",
 		e.Address, e.LatencyMs, success, e.Score)
 }
 
 // HealthChecker continuously probes backends and updates their IsHealthy status.
-func HealthChecker(p *EndpointPool) {
+func HealthChecker(p *EndpointPool, cfg *config.Config) {
 	for {
 		p.Mutex.RLock()
 		endpoints := p.Endpoints
@@ -101,15 +97,15 @@ func HealthChecker(p *EndpointPool) {
 			wg.Add(1)
 			go func(ep *Endpoint) {
 				defer wg.Done()
-				checkBackendHealth(ep)
+				checkBackendHealth(ep, cfg)
 			}(ep)
 		}
 		wg.Wait()
-		time.Sleep(HealthCheckInterval)
+		time.Sleep(cfg.HealthCheckInterval)
 	}
 }
 
-func checkBackendHealth(ep *Endpoint) {
+func checkBackendHealth(ep *Endpoint, cfg *config.Config) {
 	// Mock Health Check: Send a simple GET request
 	client := http.Client{Timeout: 3 * time.Second}
 	healthURL := fmt.Sprintf("https://%s/health", ep.Address)
@@ -120,9 +116,9 @@ func checkBackendHealth(ep *Endpoint) {
 
 	if err != nil || resp.StatusCode != http.StatusOK {
 		ep.ConsecutiveFails++
-		log.Printf("[HealthCheck] %s FAILED (%d/%d): %v", ep.Address, ep.ConsecutiveFails, HealthCheckFailures, err)
+		log.Printf("[HealthCheck] %s FAILED (%d/%d): %v", ep.Address, ep.ConsecutiveFails, cfg.HealthCheckFailures, err)
 
-		if ep.ConsecutiveFails >= HealthCheckFailures && ep.IsHealthy {
+		if ep.ConsecutiveFails >= cfg.HealthCheckFailures && ep.IsHealthy {
 			ep.IsHealthy = false
 			log.Printf("[HealthCheck] %s marked UNHEALTHY (Policy: Failure Count)", ep.Address)
 		}
@@ -201,7 +197,7 @@ func (p *EndpointPool) Select() *Endpoint {
 }
 
 // ProxyHandler handles incoming client requests.
-func ProxyHandler(p *EndpointPool) http.HandlerFunc {
+func ProxyHandler(p *EndpointPool, cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -237,7 +233,7 @@ func ProxyHandler(p *EndpointPool) http.HandlerFunc {
 			success := resp.StatusCode < 500 // Treat 5xx as failure
 
 			// 4. Critical Step: Report back to ScoreTracker
-			targetEndpoint.UpdateScore(success, duration)
+			targetEndpoint.UpdateScore(success, duration, cfg.EWMAAlpha)
 			return nil
 		}
 
@@ -246,7 +242,7 @@ func ProxyHandler(p *EndpointPool) http.HandlerFunc {
 			duration := time.Since(start)
 
 			// 4. Critical Step: Report failure to ScoreTracker (Timeout Policy)
-			targetEndpoint.UpdateScore(false, duration) // Treat error/timeout as failure
+			targetEndpoint.UpdateScore(false, duration, cfg.EWMAAlpha) // Treat error/timeout as failure
 
 			http.Error(w, "Gateway Timeout or Target Error", http.StatusGatewayTimeout)
 		}
@@ -258,26 +254,42 @@ func ProxyHandler(p *EndpointPool) http.HandlerFunc {
 
 // --- Main Application Setup ---
 func main() {
+	// Parse command-line flags
+	configPath := flag.String("config", "./config.yaml", "Path to configuration file")
+	flag.Parse()
+
+	// Load configuration
+	cfg, err := config.NewConfig(*configPath)
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	// Check if config file exists to provide appropriate log message
+	if _, err := os.Stat(*configPath); os.IsNotExist(err) {
+		log.Printf("Config file %s not found, using defaults and environment variables", *configPath)
+	} else {
+		log.Printf("Loaded configuration from %s", *configPath)
+	}
+
 	// Define the pool of backend endpoints
-	backendAddrs := []string{"rpc-osmosis.ecostake.com:443", "osmosis-rpc.polkachu.com:443", "rpc.osmosis.validatus.com:443"}
-	pool := &EndpointPool{Endpoints: make([]*Endpoint, 0, len(backendAddrs))}
+	pool := &EndpointPool{Endpoints: make([]*Endpoint, 0, len(cfg.BackendAddresses))}
 
 	// Populate the EndpointPool
-	for _, addr := range backendAddrs {
+	for _, addr := range cfg.BackendAddresses {
 		pool.Endpoints = append(pool.Endpoints, NewEndpoint(addr))
 	}
 
 	log.Println("All mock backend servers started.")
 
 	// 1. Start Management Layer routines
-	go HealthChecker(pool)
+	go HealthChecker(pool, cfg)
 	log.Println("HealthChecker started.")
 
 	// 2. Start Request Layer (Proxy Server)
-	proxyAddr := fmt.Sprintf(":%d", ProxyPort)
+	proxyAddr := fmt.Sprintf(":%d", cfg.ProxyPort)
 	log.Printf("Starting Load Balancing Proxy on %s", proxyAddr)
 
-	http.HandleFunc("/", ProxyHandler(pool))
+	http.HandleFunc("/", ProxyHandler(pool, cfg))
 
 	if err := http.ListenAndServe(proxyAddr, nil); err != nil {
 		log.Fatalf("Proxy failed to start: %v", err)
