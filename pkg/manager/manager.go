@@ -33,15 +33,49 @@ type EndpointPool struct {
 }
 
 // NewEndpoint creates a new endpoint, parsing the address into a URL object.
+// Supports multiple URL formats:
+//   - host:port
+//   - http://host:port
+//   - https://host:port
+//   - host:port/rpc
+//   - http://host:port/rpc
+//   - https://host:port/rpc
 func NewEndpoint(addr string) *Endpoint {
-	// Determine scheme based on port: 443 = HTTPS, others = HTTP
-	scheme := "http"
-	if len(addr) > 4 && addr[len(addr)-4:] == ":443" {
-		scheme = "https"
+	var u *url.URL
+	var err error
+
+	// Try parsing as a full URL first
+	u, err = url.Parse(addr)
+	if err != nil || u.Scheme == "" {
+		// No scheme provided, determine scheme based on port
+		scheme := "http"
+		if len(addr) > 4 && addr[len(addr)-4:] == ":443" {
+			scheme = "https"
+		}
+		// Parse with prepended scheme
+		u, err = url.Parse(fmt.Sprintf("%s://%s", scheme, addr))
+		if err != nil {
+			// Fallback: create a minimal URL
+			u, _ = url.Parse(fmt.Sprintf("http://%s", addr))
+		}
 	}
-	u, _ := url.Parse(fmt.Sprintf("%s://%s", scheme, addr))
+
+	// Normalize the URL: ensure path starts with / if present
+	if u.Path != "" && u.Path[0] != '/' {
+		u.Path = "/" + u.Path
+	}
+
+	// Store the original address for logging/display purposes
+	displayAddr := addr
+	if u.Host != "" {
+		displayAddr = u.Host
+		if u.Path != "" {
+			displayAddr = u.Host + u.Path
+		}
+	}
+
 	return &Endpoint{
-		Address:   addr,
+		Address:   displayAddr,
 		URL:       u,
 		IsHealthy: true, // Assume healthy on startup
 		Score:     0.5,  // Start at baseline score
@@ -105,8 +139,22 @@ func HealthChecker(p *EndpointPool, cfg *config.Config) {
 func checkBackendHealth(ep *Endpoint, cfg *config.Config) {
 	// Mock Health Check: Send a simple GET request
 	client := http.Client{Timeout: 3 * time.Second}
-	// Use the endpoint's scheme (HTTP or HTTPS) as determined during initialization
-	healthURL := fmt.Sprintf("%s://%s/health", ep.URL.Scheme, ep.Address)
+	// Construct health check URL using the endpoint's base URL and append /health
+	baseURL := ep.URL
+	healthPath := "/health"
+	
+	// If endpoint has a base path, append /health to it
+	if baseURL.Path != "" && baseURL.Path != "/" {
+		// Ensure base path ends with / before appending health
+		if baseURL.Path[len(baseURL.Path)-1] == '/' {
+			healthPath = baseURL.Path + "health"
+		} else {
+			healthPath = baseURL.Path + "/health"
+		}
+	}
+	
+	// Build the full health check URL
+	healthURL := fmt.Sprintf("%s://%s%s", baseURL.Scheme, baseURL.Host, healthPath)
 	resp, err := client.Get(healthURL)
 
 	ep.Mutex.Lock()

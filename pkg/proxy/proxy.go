@@ -31,8 +31,40 @@ func ProxyHandler(p *manager.EndpointPool, cfg *config.Config) http.HandlerFunc 
 			// Override the request URL to use the target endpoint's scheme and host
 			req.URL.Scheme = targetEndpoint.URL.Scheme
 			req.URL.Host = targetEndpoint.URL.Host
-			req.URL.Path = r.URL.Path
-			req.URL.RawPath = r.URL.RawPath
+
+			// Preserve the endpoint's base path and append the incoming request path
+			basePath := targetEndpoint.URL.Path
+			incomingPath := r.URL.Path
+			incomingRawPath := r.URL.RawPath
+
+			// Combine base path with incoming path
+			if basePath != "" && basePath != "/" {
+				// If base path exists, prepend it to the incoming path
+				if incomingPath == "" || incomingPath == "/" {
+					req.URL.Path = basePath
+					// Clear RawPath since we're using a new path
+					req.URL.RawPath = ""
+				} else {
+					// Ensure base path ends with / and incoming path doesn't start with /
+					var combinedPath string
+					if basePath[len(basePath)-1] != '/' && incomingPath[0] != '/' {
+						combinedPath = basePath + "/" + incomingPath
+					} else if basePath[len(basePath)-1] == '/' && incomingPath[0] == '/' {
+						combinedPath = basePath + incomingPath[1:]
+					} else {
+						combinedPath = basePath + incomingPath
+					}
+					req.URL.Path = combinedPath
+					// Clear RawPath since we've modified the path
+					// The URL package will handle encoding when needed
+					req.URL.RawPath = ""
+				}
+			} else {
+				// No base path, use incoming path as-is
+				req.URL.Path = incomingPath
+				// Preserve RawPath only if Path wasn't modified
+				req.URL.RawPath = incomingRawPath
+			}
 			req.URL.RawQuery = r.URL.RawQuery
 			req.Host = targetEndpoint.URL.Host
 			// Preserve headers but ensure Host is set correctly
@@ -69,4 +101,3 @@ func ProxyHandler(p *manager.EndpointPool, cfg *config.Config) http.HandlerFunc 
 		proxy.ServeHTTP(w, r)
 	}
 }
-
