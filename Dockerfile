@@ -13,15 +13,6 @@ COPY . .
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux go build -o /app/lambo ./cmd/lambo/main.go
 
-# Conditionally copy config.yaml if it exists (application works without it using env vars/defaults)
-# Always create /app/config.yaml: copy from source if it exists, otherwise create empty file
-# The application handles missing/invalid config files gracefully
-RUN if [ -f config.yaml ]; then \
-        cp config.yaml /app/config.yaml; \
-    else \
-        touch /app/config.yaml; \
-    fi
-
 # Runtime stage
 FROM gcr.io/distroless/static-debian12:nonroot
 
