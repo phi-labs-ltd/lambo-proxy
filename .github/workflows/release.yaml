@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - netx-678-add-dockerfile-and-publish-docker-image-to-ghcr
     tags:
       - 'v*'
   workflow_dispatch:
