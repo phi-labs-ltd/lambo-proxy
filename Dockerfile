@@ -39,4 +39,4 @@ EXPOSE 8080
 WORKDIR /app
 
 # Run the binary with default config path
-ENTRYPOINT ["/app/lambo", "-config", "/app/config.yaml"]
+ENTRYPOINT ["/app/lambo"]
